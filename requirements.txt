@@ -1,0 +1,17 @@
+langchain-ollama>=0.1.0
+langchain-huggingface>=0.0.39
+langchain-milvus>=0.1.4
+langchain-core>=0.1.0
+langchain>=0.1.0
+pymilvus>=2.3.0
+langgraph>=0.0.35
+streamlit>=1.28.0
+beautifulsoup4>=4.12.0
+duckduckgo-search>=3.9.5
+langchain-text-splitters>=0.0.1
+requests>=2.31.0
+pypdf>=3.17.0
+PyMuPDF>=1.23.0
+pdfminer>=20191020
+pytesseract>=0.3.10
+Pillow>=10.0.0
