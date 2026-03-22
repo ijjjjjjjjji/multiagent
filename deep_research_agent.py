@@ -2,6 +2,7 @@ import json
 import math
 import argparse
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import TypedDict, List, Literal
 from urllib.parse import urlsplit, urlunsplit
@@ -16,7 +17,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pymilvus import connections
 from langgraph.graph import StateGraph, START, END
 
-# 导入我们刚刚写好的动态数据泵（确保 dynamic_searcher.py 在同级目录）
 import dynamic_searcher
 
 def print_step(title):
@@ -42,10 +42,12 @@ def _clean_model_output(text: str) -> str:
 
 
 def _report_len(text: str) -> int:
+    """计算文本实际长度（去除首尾空白）"""
     return len((text or "").strip())
 
 
 def _parse_fact_check_fallback(raw_text: str) -> "FactCheckResult":
+    """解析 Fact-Checker 输出的 JSON，支持双重降级"""
     cleaned = _clean_model_output(raw_text)
     try:
         return FactCheckResult.model_validate_json(cleaned)
@@ -54,26 +56,29 @@ def _parse_fact_check_fallback(raw_text: str) -> "FactCheckResult":
         return FactCheckResult.model_validate(data)
 
 
-SEMANTIC_SIM_THRESHOLD = 0.35
-MIN_HIGH_QUALITY_SOURCES = 8
-MIN_HIGH_QUALITY_SOURCES_FALLBACK = 5
-SEMANTIC_SIM_FALLBACKS = [0.35, 0.25, 0.15]
+# ===== 检索与质量控制参数 =====
+SEMANTIC_SIM_THRESHOLD = 0.35        # 初始语义相似度阈值
+MIN_HIGH_QUALITY_SOURCES = 8         # 目标高质量源数
+MIN_HIGH_QUALITY_SOURCES_FALLBACK = 5  # 降级后的最少源数
+SEMANTIC_SIM_FALLBACKS = [0.35, 0.25, 0.15]  # 阈值渐进降级策略
 
-# Writer 长度控制：避免“万字报告”生成过短。
-MIN_REPORT_CHARS = 4000
-TARGET_REPORT_CHARS = 6000
-MAX_EXPAND_ROUNDS = 2
-MAX_SECTION_EXPAND_ROUNDS = 1
-MAX_RETRY_COUNT = 3
+# ===== 写作与长度控制参数 =====
+MIN_REPORT_CHARS = 4000              # 最低章节长度要求
+TARGET_REPORT_CHARS = 6000           # 目标章节长度
+MAX_EXPAND_ROUNDS = 2                # 全报告最多扩写轮次
+MAX_SECTION_EXPAND_ROUNDS = 1        # 单章最多扩写轮次
+MAX_RETRY_COUNT = 3                  # 审查最多重试次数
+
+# ===== 模型超时控制（秒）=====
 WRITER_FIRST_DRAFT_TIMEOUT_SEC = 180
 WRITER_EXPAND_TIMEOUT_SEC = 150
 WRITER_SECTION_TIMEOUT_SEC = 120
 WRITER_SECTION_EXPAND_TIMEOUT_SEC = 90
 FACT_CHECK_TIMEOUT_SEC = 90
 
-# Ollama 生成上限与采样设置：避免默认 token 上限导致章节被截断。
-OLLAMA_NUM_PREDICT = 2048
-OLLAMA_TOP_P = 0.9
+# ===== Ollama 生成参数 =====
+OLLAMA_NUM_PREDICT = 2048            # 最多生成 token 数，防止截断
+OLLAMA_TOP_P = 0.9                   # 核采样参数，控制多样性
 
 
 class FactCheckResult(BaseModel):
@@ -106,28 +111,30 @@ class ReportExpandResult(BaseModel):
         description="完整可替换的 Markdown 报告",
     )
 
-# ================= 核心 1: 定义全局多智能体状态 (State) =================
-# 这是整个系统的“共享内存”。Agent 之间绝不直接通信，而是全靠读写这个 State。
+# ===== 核心 1: LangGraph 全局状态定义 =====
 class ResearchState(TypedDict):
-    topic: str               # 初始输入：用户指定的宏大研究主题
-    sub_queries: List[str]   # Editor 生成的拆解子课题（搜索关键词）
-    context: str             # Searcher 抓取并入库后，检索出的相关图文片段集合
-    draft: str               # Writer 撰写的初稿
-    critique: str            # Fact-Checker 给出的打回修改意见
+    """多智能体间的共享状态机。无直接通信，所有数据交换通过 State 字段"""
+    topic: str
+    sub_queries: List[str]   # Editor 拆解输出
+    context: str             # Searcher 检索结果（含来源标注）
+    draft: str               # Writer 撰写的报告
+    critique: str            # Fact-Checker 的修改意见
     fact_check_is_pass: bool
     fact_check_error_type: str
     fact_check_feedback: str
-    new_search_query: str
-    retry_count: int
-    trace: List[dict]
-    iterations: int          # 记录图流转的次数，防止死循环
+    new_search_query: str    # 新增补检索词（由 Checker 提出）
+    retry_count: int         # 当前循环的重试计数
+    trace: List[dict]        # 执行路由追踪
+    iterations: int          # 防止死循环的迭代计数
 
-# ================= 核心 2: 初始化本地算力引擎 =================
-_LLM = None
-_EMBEDDINGS = None
+# ===== 核心 2: 全局模型实例（单例模式）===== 
+_LLM = None          # ChatOllama 实例
+_EMBEDDINGS = None   # HuggingFaceEmbeddings 实例
+_RUN_LOCK = threading.Lock()
 
 
 def _get_llm() -> ChatOllama:
+    """获取 LLM 实例（首次调用时初始化"""
     global _LLM
     if _LLM is None:
         print("🧠 正在唤醒本地 4090 算力引擎 (Qwen2.5-7B)...")
@@ -142,7 +149,17 @@ def _get_llm() -> ChatOllama:
 
 
 def _invoke_chain_with_timeout(chain, payload: dict, timeout_sec: int, stage_name: str):
-    """为大模型调用增加超时保护，避免长时间无响应。"""
+    """执行 LangChain 链调用，带超时保护和降级
+    
+    Args:
+        chain: LangChain Runnable 对象
+        payload: 调用输入参数
+        timeout_sec: 超时时间（秒）
+        stage_name: 阶段名称（用于日志和错误追踪）
+    
+    Returns:
+        模型输出或 None（超时时）
+    """
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(chain.invoke, payload)
         try:
@@ -160,13 +177,18 @@ def _invoke_structured_with_timeout(
     timeout_sec: int,
     stage_name: str,
 ):
-    """固定使用结构化输出（Function Calling）执行模型调用。"""
+    """调用模型并强制返回指定 Pydantic 模式的输出（结构化输出）
+    
+    这是本系统的核心：确保所有 LLM 调用都返回结构化输出，不产生自由文本。
+    模型无工具选择自由，必须输出指定的 Pydantic 字段。
+    """
     structured_llm = llm.with_structured_output(output_model)
     chain = prompt | structured_llm
     return _invoke_chain_with_timeout(chain, {}, timeout_sec, stage_name)
 
 
 def _get_embeddings() -> HuggingFaceEmbeddings:
+    """获取嵌入模型实例（首次调用时初始化）"""
     global _EMBEDDINGS
     if _EMBEDDINGS is None:
         _EMBEDDINGS = HuggingFaceEmbeddings(
@@ -176,16 +198,13 @@ def _get_embeddings() -> HuggingFaceEmbeddings:
         )
     return _EMBEDDINGS
 
-# ================= 核心 3: 主编智能体 (Editor Node) =================
+# ===== 核心 3: Editor 节点（主编智能体）===== 
 def editor_node(state: ResearchState) -> dict:
-    """
-    Editor Agent: 负责将宽泛的研究主题，拆解为具体的搜索引擎关键词。
-    """
+    """将宽泛的研究主题拆解为 3 个具体的搜索关键词，输出结构化 EditorPlanResult"""
     print_step("👔 [Editor Agent] 主编正在拆解研究课题...")
     topic = state["topic"]
     print(f"   ➤ 收到总课题: '{topic}'")
     
-    # 强制结构化 Function Calling，避免自由文本输出污染。
     system_prompt = """你是一位资深的行业研究主编。
 你的任务是将用户提供的【宏大研究主题】，拆解为 3 个极具针对性的【搜索引擎关键词】。
 这些关键词必须涵盖：1. 核心技术突破 2. 市场规模与商业化 3. 行业痛点与竞品。
@@ -202,7 +221,7 @@ def editor_node(state: ResearchState) -> dict:
     ])
 
     llm = _get_llm()
-    # 固定按流程调用该“函数”，不给模型工具选择自由。
+    # 调用结构化输出，模型必须返回 EditorPlanResult 格式
     response = _invoke_structured_with_timeout(
         llm=llm,
         prompt=prompt,
@@ -216,7 +235,7 @@ def editor_node(state: ResearchState) -> dict:
             raise TimeoutError("Editor 结构化调用超时")
 
         sub_queries = [q.strip() for q in response.sub_queries if (q or "").strip()]
-        # 去重保序，避免重复检索。
+        # 去重保序以避免重复检索同一关键词
         deduped = []
         seen = set()
         for q in sub_queries:
@@ -231,17 +250,19 @@ def editor_node(state: ResearchState) -> dict:
             
     except Exception as e:
         print(f"   ⚠️ Editor 结构化调用失败: {str(e)}。触发 Fallback 机制。")
-        # 兜底：如果解析失败，直接把原问题当成唯一的搜索词
+        # 降级：模型调用失败时，用简单规则生成备选关键词
         sub_queries = [f"{topic} 最新进展", f"{topic} 商业化落地"]
         
     print(f"   ➤ 课题拆解完成！子课题清单: {sub_queries}")
-    
-    # 返回更新 State 中的 sub_queries 字段
     return {"sub_queries": sub_queries}
 
-# ================= 核心 4: 重建动态混合检索器 (Helper 函数) =================
+# ===== 核心 4: 动态检索器构建 ===== 
 def build_dynamic_retriever():
-    """唤醒刚刚由 dynamic_searcher 动态生成的 Milvus 和 BM25 索引"""
+    """重建混合检索器（Milvus 密集向量 + BM25 稀疏）
+    
+    从 dynamic_searcher 的持久化文件中恢复 DocStore 和 BM25 索引，
+    与 Milvus 向量库联合构成 EnsembleRetriever（70% 语义 + 30% 关键词）
+    """
     print("⏳ [系统] 正在唤醒动态知识库引擎，准备提炼 Context...")
     
     embeddings = _get_embeddings()
@@ -254,14 +275,13 @@ def build_dynamic_retriever():
     )
     connections.connect(alias=vectorstore.alias, uri=milvus_uri)
 
-    # 加载刚抓取完持久化到本地的 DocStore 和 BM25
+    # 从文件恢复 DocStore（父文档存储）和 BM25 索引
     with open(dynamic_searcher.STORE_PATH, "rb") as f:
         saved_data = pickle.load(f)
         store = saved_data["docstore"]
         bm25_retriever = saved_data["bm25"]
 
-    # 新版 ParentDocumentRetriever 会校验 splitter 类型，
-    # 这里保持与 dynamic_searcher.py 入库阶段一致的切片参数。
+    # 保持与摄取阶段一致的父子分割参数
     parent_splitter = RecursiveCharacterTextSplitter(
         chunk_size=600,
         chunk_overlap=50,
@@ -280,26 +300,28 @@ def build_dynamic_retriever():
         parent_splitter=parent_splitter,
     )
     
-    # RRF 融合：70% 语义 + 30% 关键词
+    # 混合检索：来自向量的语义相似文档（70%）和 BM25 关键词匹配（30%）
     return EnsembleRetriever(retrievers=[parent_retriever, bm25_retriever], weights=[0.7, 0.3])
 
 
-# ================= 核心 5: 研究员智能体 (Searcher Node) =================
+# ===== 核心 5: Searcher 节点（研究员智能体）===== 
 def searcher_node(state: ResearchState) -> dict:
-    """
-    Searcher Agent: 负责全网扫街、数据动态入库，并提炼出高价值的 Context。
+    """执行网络检索、文档摄取、混合检索三步，提炼高价值的 Context
+    
+    固定流程：search_tool_collect → search_tool_ingest → search_tool_retrieve
     """
     print_step("🕵️ [Searcher Agent] 研究员开始全网扫街与知识淬炼...")
     sub_queries = list(state["sub_queries"])
     topic = state["topic"]
 
-    # 若 Fact-Checker 判断信息不足，则优先注入补检索词。
+    # 若前一轮检查认为信息不足，优先加入补充检索词
     extra_query = (state.get("new_search_query") or "").strip()
     if extra_query and extra_query not in sub_queries:
         sub_queries.insert(0, extra_query)
         print(f"   ➤ Fact-Checker 触发补检索词: {extra_query}")
 
-    # 固定流程执行显式工具：collect -> ingest -> retrieve。
+    # 三步检索流程：先采集 -> 再入库 -> 最后检索
+    
     all_scraped_docs, collect_result = dynamic_searcher.search_tool_collect_documents(
         sub_queries=sub_queries,
         max_results_per_query=8,
@@ -611,6 +633,25 @@ def fact_checker_node(state: ResearchState) -> dict:
     context = state.get("context", "")
     draft = state.get("draft", "")
 
+    # 对系统级失败提示做硬规则判定：此类结果不是可用报告，必须触发补检索。
+    failure_markers = ("【系统提示】", "检索失败", "证据不足")
+    if any(marker in draft for marker in failure_markers):
+        result = FactCheckResult(
+            is_pass=False,
+            error_type="missing_info",
+            feedback="当前草稿为检索不足的系统提示，需先补充检索证据后再生成报告。",
+            new_search_query=topic,
+        )
+        current_retry = state.get("retry_count", 0) + 1
+        return {
+            "fact_check_is_pass": result.is_pass,
+            "fact_check_error_type": result.error_type,
+            "fact_check_feedback": result.feedback,
+            "new_search_query": result.new_search_query,
+            "critique": result.feedback,
+            "retry_count": current_retry,
+        }
+
     if not draft.strip():
         result = FactCheckResult(
             is_pass=False,
@@ -821,7 +862,9 @@ def run_research(topic: str) -> dict:
     )
 
     app = build_research_graph()
-    state = app.invoke(initial_state)
+    # 单进程互斥，避免并发调用导致日志交错和重复执行观感。
+    with _RUN_LOCK:
+        state = app.invoke(initial_state)
     return state
 
 
