@@ -40,6 +40,7 @@ Editor -> Searcher -> Writer -> Fact Checker -> Router
 - 编排: LangGraph
 - 大模型: Ollama (qwen2.5:7b-instruct)
 - 向量模型: BAAI/bge-m3
+- 重排模型: Cross-Encoder（默认 BAAI/bge-reranker-v2-m3，失败自动回退为余弦重排）
 - 向量库: Milvus Lite
 - 稀疏检索: BM25
 - 前端: Streamlit
