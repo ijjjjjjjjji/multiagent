@@ -5,6 +5,7 @@ import atexit
 import io
 import re
 import math
+import threading
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
@@ -55,6 +56,11 @@ try:
 except Exception:
     pytesseract = None
 
+try:
+    from sentence_transformers import CrossEncoder
+except Exception:
+    CrossEncoder = None
+
 def print_step(title):
     print(f"\n{'-'*15} {title} {'-'*15}")
 
@@ -99,6 +105,14 @@ SUSPECT_BLOCK_PATTERNS = [
     "captcha", "verify you are human", "access denied", "forbidden",
     "cloudflare", "robot check", "security check", "请完成验证", "访问受限"
 ]
+
+CROSS_ENCODER_MODEL_NAME = os.getenv("CROSS_ENCODER_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
+CROSS_ENCODER_DEVICE = os.getenv("CROSS_ENCODER_DEVICE", "cuda")
+CROSS_ENCODER_MAX_CHARS = int(os.getenv("CROSS_ENCODER_MAX_CHARS", "1500"))
+
+_CROSS_ENCODER = None
+_CROSS_ENCODER_INIT_FAILED = False
+_CROSS_ENCODER_LOCK = threading.Lock()
 
 
 def _build_http_session() -> requests.Session:
@@ -280,6 +294,57 @@ def _tokenize_for_scoring(text: str) -> list[str]:
 def _looks_like_block_page(text: str) -> bool:
     low = (text or "").lower()
     return any(p in low for p in SUSPECT_BLOCK_PATTERNS)
+
+
+def _get_cross_encoder():
+    """延迟加载 Cross-Encoder，初始化失败时返回 None 并自动降级。"""
+    global _CROSS_ENCODER, _CROSS_ENCODER_INIT_FAILED
+    if _CROSS_ENCODER is not None:
+        return _CROSS_ENCODER
+    if _CROSS_ENCODER_INIT_FAILED:
+        return None
+
+    with _CROSS_ENCODER_LOCK:
+        if _CROSS_ENCODER is not None:
+            return _CROSS_ENCODER
+        if _CROSS_ENCODER_INIT_FAILED:
+            return None
+
+        if CrossEncoder is None:
+            print("   ⚠️ 未安装 sentence-transformers，重排将回退为余弦相似度。")
+            _CROSS_ENCODER_INIT_FAILED = True
+            return None
+
+        try:
+            print(f"   ➤ 正在加载 Cross-Encoder 重排模型: {CROSS_ENCODER_MODEL_NAME}")
+            _CROSS_ENCODER = CrossEncoder(
+                CROSS_ENCODER_MODEL_NAME,
+                device=CROSS_ENCODER_DEVICE,
+                trust_remote_code=True,
+            )
+            return _CROSS_ENCODER
+        except Exception as e:
+            print(f"   ⚠️ Cross-Encoder 初始化失败，将回退余弦重排: {e}")
+            _CROSS_ENCODER_INIT_FAILED = True
+            return None
+
+
+def _cross_encoder_rerank(topic: str, docs: list[Document]) -> list[float]:
+    """使用 Cross-Encoder 对候选文档打分；失败时抛出异常供上层降级。"""
+    model = _get_cross_encoder()
+    if model is None:
+        raise RuntimeError("cross_encoder_unavailable")
+
+    pairs = []
+    for doc in docs:
+        content = (doc.page_content or "").strip()
+        pairs.append([topic, content[:CROSS_ENCODER_MAX_CHARS]])
+
+    try:
+        scores = model.predict(pairs, batch_size=8, show_progress_bar=False)
+        return [float(s) for s in scores]
+    except Exception as e:
+        raise RuntimeError(f"cross_encoder_predict_error: {e}") from e
 
 # ================= 核心 1: 网页抓取与清洗 =================
 def _compute_result_score(query: str, title: str, snippet: str) -> float:
@@ -600,6 +665,7 @@ def search_tool_retrieve_context(
     min_high_quality_sources_fallback: int,
     candidate_limit: int = 20,
     max_return_docs: int = 15,
+    use_cross_encoder: bool = True,
 ):
     """显式工具3：基于已入库数据做检索、重排与上下文组装。"""
     candidates = retriever.invoke(topic)[:candidate_limit]
@@ -628,12 +694,30 @@ def search_tool_retrieve_context(
 
         doc_vec = rerank_embeddings.embed_query(content[:1200])
         sim = _cosine_similarity(topic_vec, doc_vec)
-        prepared.append((sim, doc, normalized_source))
+        prepared.append((sim, doc, normalized_source, content))
 
         if normalized_source:
             seen_prepare_sources.add(normalized_source)
 
-    prepared.sort(key=lambda x: x[0], reverse=True)
+    rerank_strategy = "cosine"
+    if use_cross_encoder and prepared:
+        try:
+            docs_for_ce = [item[1] for item in prepared]
+            ce_scores = _cross_encoder_rerank(topic, docs_for_ce)
+            with_ce = []
+            for (sim, doc, normalized_source, content), ce_score in zip(prepared, ce_scores):
+                with_ce.append((float(ce_score), sim, doc, normalized_source, content))
+            with_ce.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            prepared = [(sim, doc, normalized_source, content) for _, sim, doc, normalized_source, content in with_ce]
+            rerank_strategy = "cross_encoder"
+        except Exception as e:
+            print(f"   ⚠️ Cross-Encoder 重排失败，自动回退余弦重排: {e}")
+            prepared.sort(key=lambda x: x[0], reverse=True)
+            rerank_strategy = "cosine_fallback"
+    else:
+        prepared.sort(key=lambda x: x[0], reverse=True)
+
+    print(f"   ➤ 重排策略: {rerank_strategy}")
 
     target_min_sources = (
         min_high_quality_sources
@@ -645,7 +729,7 @@ def search_tool_retrieve_context(
     used_threshold = semantic_sim_threshold
     for threshold in semantic_sim_fallbacks:
         tmp = []
-        for sim, doc, _ in prepared:
+        for sim, doc, _, _ in prepared:
             if sim < threshold:
                 continue
             tmp.append(doc)
@@ -667,6 +751,7 @@ def search_tool_retrieve_context(
             "context": "",
             "high_quality_sources": len(retrieved_docs),
             "used_threshold": used_threshold,
+            "rerank_strategy": rerank_strategy,
         }
 
     if used_threshold < semantic_sim_threshold:
@@ -690,6 +775,7 @@ def search_tool_retrieve_context(
         "context": context_str,
         "high_quality_sources": len(retrieved_docs),
         "used_threshold": used_threshold,
+        "rerank_strategy": rerank_strategy,
     }
 
 
